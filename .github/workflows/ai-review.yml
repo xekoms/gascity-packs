@@ -1,0 +1,371 @@
+# ai-review: the required AI review status check for the xekoms PR policy.
+#
+# Canonical copy: xekoms/tower .github/workflows/ai-review.yml. Every repo carries an identical
+# copy (except `runs-on`) because cross-repo reusable workflows need private-repo Actions
+# access that only an admin can enable, and KEYSTONE's runner contract forbids them.
+#
+# What it does on every non-draft PR to main (the check is named `ai-review`):
+#   1. Flags consequential paths (.github/ai-review/consequential-paths.txt, read from the BASE
+#      branch) -> adds the `needs-bradley` label and requires a filled-in
+#      "What Bradley needs to know" section plus Bradley's approval of the exact head commit.
+#   2. Reviews the PR for safety, quality, purpose and spec fit (.github/ai-review/prompt.md,
+#      read from the BASE branch) with the first provider that works:
+#        Claude (federation -> API key -> subscription, same order and names as tower #498)
+#        -> Codex (OPENAI_API_KEY) -> Copilot code review (no secret; comment-only).
+#   3. Posts the findings as a PR review (inline threads where the line is in the diff) and
+#      passes or fails. It never reports "skipped" on a ready PR: either success or failure.
+# Draft PRs get an immediate success ("deferred until ready") so nothing is billed early;
+# `ready_for_review` starts the real review. A review by Bradley re-runs only the cheap gate.
+# No `paths:` filter on purpose: a required check that never reports blocks the PR forever.
+name: ai-review
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, edited, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+  merge_group:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write # only used by the Claude federation path
+
+# A new push cancels the in-flight review for that PR. Cheap gate re-checks (description edits,
+# label changes, Bradley's review) get their own group so they never cancel a paid review.
+concurrency:
+  group: >-
+    ai-review-${{ github.event.pull_request.number || github.ref }}-${{
+    (github.event_name == 'pull_request_review' || contains('edited labeled unlabeled', github.event.action))
+    && github.run_id || 'review' }}
+  cancel-in-progress: true
+
+env:
+  OWNER_LOGIN: ${{ vars.AI_REVIEW_OWNER_LOGIN || 'xekoms' }}
+  COPILOT_WAIT_SECONDS: ${{ vars.AI_REVIEW_COPILOT_WAIT_SECONDS || '900' }}
+
+jobs:
+  ai-review:
+    name: ai-review
+    runs-on: ${{ fromJSON(vars.AI_REVIEW_RUNS_ON || '["ubuntu-latest"]') }}
+    timeout-minutes: 45
+    steps:
+      - name: Decide what this run does
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          mode=review
+          if [ "$EVENT" = merge_group ]; then
+            mode=skip; echo "::notice::merge_group: the PR already passed ai-review before it was queued."
+          elif [ "$DRAFT" = true ]; then
+            mode=skip; echo "::notice::Draft PR: AI review deferred until the PR is marked ready for review."
+          elif [ "$HEAD_REPO" != "$REPO" ]; then
+            mode=fork
+          elif [ "$EVENT" = pull_request_review ] || [ "$ACTION" = edited ] || [ "$ACTION" = labeled ] || [ "$ACTION" = unlabeled ]; then
+            mode=gate # re-check label/section/approval against the last AI verdict for this head
+          fi
+          [ "$PR_AUTHOR" = 'dependabot[bot]' ] && echo "dependabot=true" >> "$GITHUB_OUTPUT" || echo "dependabot=false" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode"
+
+      - name: Refuse fork PRs
+        if: steps.mode.outputs.mode == 'fork'
+        run: |
+          echo "::error::PRs from forks get no review credentials. Push the branch to this repository instead."
+          exit 1
+
+      - name: Check out the PR head
+        if: steps.mode.outputs.mode == 'review' || steps.mode.outputs.mode == 'gate'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Build review context and apply the consequential-change gate
+        id: ctx
+        if: steps.mode.outputs.mode == 'review' || steps.mode.outputs.mode == 'gate'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          ctx=ai-review-context
+          rm -rf "$ctx"; mkdir -p "$ctx"
+          # Checkout ran with persist-credentials: false, so git has no token. Reads of the base
+          # go through the API, and the one git fetch below passes the token for that call only.
+          authgit() {
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" "$@"
+          }
+
+          # Policy files come from the BASE branch so a PR cannot weaken its own review.
+          # The first rollout PR has no base copy yet, so it falls back to the PR's copy.
+          for f in prompt.md output-schema.json consequential-paths.txt; do
+            if gh api -H 'Accept: application/vnd.github.raw' \
+                "repos/$REPO/contents/.github/ai-review/$f?ref=$BASE_SHA" > "$ctx/$f" 2>/dev/null; then
+              :
+            elif [ -f ".github/ai-review/$f" ]; then
+              echo "::warning::.github/ai-review/$f is not on the base branch yet; using the PR's copy."
+              cp ".github/ai-review/$f" "$ctx/$f"
+            else
+              echo "::error::.github/ai-review/$f is missing."; exit 1
+            fi
+          done
+
+          gh api "repos/$REPO/pulls/$PR" > "$ctx/pr.json"
+          jq -r '"# " + .title + "\n\n" + (.body // "(no description)")' "$ctx/pr.json" > "$ctx/pr.md"
+          gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" \
+            --jq '.[] | "\(.status)\t+\(.additions)\t-\(.deletions)\t\(.filename)\(if .previous_filename then "\t(renamed from \(.previous_filename))" else "" end)"' \
+            > "$ctx/changed-files.txt"
+          gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" \
+            --jq '.[] | .filename, (.previous_filename // empty)' | sort -u > "$ctx/paths.txt"
+
+          # Full diff: the API refuses very large diffs, so fall back to git.
+          if ! gh api -H 'Accept: application/vnd.github.diff' "repos/$REPO/pulls/$PR" > "$ctx/pr.diff" 2>/dev/null; then
+            mb=$(gh api "repos/$REPO/compare/$BASE_SHA...$HEAD_SHA" --jq .merge_base_commit.sha)
+            authgit fetch --no-tags --depth=1 origin "$mb"
+            git diff "$mb" "$HEAD_SHA" > "$ctx/pr.diff"
+          fi
+          printf 'PR #%s in %s\nbase %s\nhead %s\nchanged files: %s\ndiff lines: %s\n' \
+            "$PR" "$REPO" "$BASE_SHA" "$HEAD_SHA" "$(wc -l < "$ctx/paths.txt")" "$(wc -l < "$ctx/pr.diff")" > "$ctx/summary.txt"
+
+          grep -vE '^[[:space:]]*(#|$)' "$ctx/consequential-paths.txt" > "$ctx/patterns.txt" || true
+          grep -Ef "$ctx/patterns.txt" "$ctx/paths.txt" > "$ctx/consequential.txt" || true
+          flagged=false
+          labelled=$(jq -r '[.labels[].name] | index("needs-bradley") != null' "$ctx/pr.json")
+          if [ -s "$ctx/consequential.txt" ]; then
+            flagged=true
+            echo "::notice::Consequential paths changed:"; sed 's/^/  /' "$ctx/consequential.txt"
+            if [ "$labelled" != true ]; then
+              gh api -X POST "repos/$REPO/issues/$PR/labels" -f 'labels[]=needs-bradley' > /dev/null
+              labelled=true
+            fi
+          fi
+          [ "$labelled" = true ] && flagged=true
+
+          # "What Bradley needs to know" must exist and say something real when flagged.
+          section=$(jq -r '.body // ""' "$ctx/pr.json" | perl -0777 -ne '
+            s/\r//g; s/<!--.*?-->//gs;
+            if (/^#+[ \t]*What Bradley needs to know[^\n]*\n(.*?)(?=^#+[ \t]|\z)/msi) { $x = $1; $x =~ s/^\s+|\s+$//g; print $x }')
+          section_ok=false
+          if [ -n "$section" ] && ! grep -qiE '^[[:space:]]*(nothing|n/?a|none)\b' <<< "$section"; then
+            section_ok=true
+          fi
+
+          approved=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews?per_page=100" \
+            --jq ".[] | select(.user.login == \"$OWNER_LOGIN\" and .state != \"COMMENTED\") | {state, commit_id}" \
+            | jq -s --arg sha "$HEAD_SHA" 'last | (. != null and .state == "APPROVED" and .commit_id == $sha)')
+          [ "$approved" = true ] || approved=false
+
+          {
+            echo "flagged=$flagged"
+            echo "section_ok=$section_ok"
+            echo "approved=$approved"
+            echo "schema=$(jq -c . "$ctx/output-schema.json")"
+          } >> "$GITHUB_OUTPUT"
+          echo "flagged=$flagged section_ok=$section_ok approved=$approved"
+
+      - name: Choose a review provider
+        id: provider
+        if: steps.mode.outputs.mode == 'review'
+        env:
+          FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          HAS_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          HAS_OPENAI_KEY: ${{ secrets.OPENAI_API_KEY != '' }}
+          DISABLED: ${{ vars.AI_REVIEW_DISABLED_PROVIDERS }} # e.g. "claude" while its quota is exhausted
+        run: |
+          set -euo pipefail
+          # Same order and names as tower #498: federation, then API key, then subscription.
+          if [ -n "$FEDERATION_RULE_ID" ] && [ -n "$ORGANIZATION_ID" ]; then claude=federation
+          elif [ -n "$FEDERATION_RULE_ID$ORGANIZATION_ID" ]; then
+            echo "::warning::Claude federation is half configured (need ANTHROPIC_FEDERATION_RULE_ID and ANTHROPIC_ORGANIZATION_ID)."; claude=none
+          elif [ "$HAS_API_KEY" = true ]; then claude=api_key
+          elif [ "$HAS_OAUTH_TOKEN" = true ]; then claude=oauth
+          else claude=none; fi
+          codex=$([ "$HAS_OPENAI_KEY" = true ] && echo yes || echo no)
+          case ",$DISABLED," in *,claude,*) claude=none;; esac
+          case ",$DISABLED," in *,codex,*) codex=no;; esac
+          copilot=yes; case ",$DISABLED," in *,copilot,*) copilot=no;; esac
+          { echo "claude=$claude"; echo "codex=$codex"; echo "copilot=$copilot"; } >> "$GITHUB_OUTPUT"
+          echo "claude=$claude codex=$codex copilot=$copilot"
+
+      - name: Review with Claude
+        id: claude
+        if: steps.mode.outputs.mode == 'review' && steps.provider.outputs.claude != 'none'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@19dda84776b3518d98b8798e591daee763049ed3 # v1
+        with:
+          anthropic_federation_rule_id: ${{ steps.provider.outputs.claude == 'federation' && vars.ANTHROPIC_FEDERATION_RULE_ID || '' }}
+          anthropic_organization_id: ${{ steps.provider.outputs.claude == 'federation' && vars.ANTHROPIC_ORGANIZATION_ID || '' }}
+          anthropic_service_account_id: ${{ steps.provider.outputs.claude == 'federation' && vars.ANTHROPIC_SERVICE_ACCOUNT_ID || '' }}
+          anthropic_workspace_id: ${{ steps.provider.outputs.claude == 'federation' && vars.ANTHROPIC_WORKSPACE_ID || '' }}
+          anthropic_api_key: ${{ steps.provider.outputs.claude == 'api_key' && secrets.ANTHROPIC_API_KEY || '' }}
+          claude_code_oauth_token: ${{ steps.provider.outputs.claude == 'oauth' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          # Always pass the workflow token: the GitHub App OIDC exchange refuses (and the action
+          # then silently "succeeds") whenever this workflow file differs from main.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_bots: '*'
+          prompt: |
+            Read ai-review-context/prompt.md and follow it exactly. It is the complete instruction
+            set for this review. Return only the structured output.
+          claude_args: >-
+            --max-turns 80
+            --allowedTools Read,Glob,Grep
+            --disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch
+            --json-schema '${{ steps.ctx.outputs.schema }}'
+
+      - name: Keep the Claude result
+        if: steps.mode.outputs.mode == 'review' && steps.claude.outcome == 'success'
+        env:
+          RESULT: ${{ steps.claude.outputs.structured_output }}
+        run: |
+          set -euo pipefail
+          if printf '%s' "$RESULT" | jq -e '.verdict == "PASS" or .verdict == "FAIL"' > /dev/null 2>&1; then
+            printf '%s' "$RESULT" > ai-review-context/result.json; echo claude > ai-review-context/provider.txt
+          else
+            echo "::warning::Claude returned no usable verdict (quota, auth or schema failure); trying the next provider."
+          fi
+
+      - name: Review with Codex
+        id: codex
+        if: steps.mode.outputs.mode == 'review' && steps.provider.outputs.codex == 'yes' && hashFiles('ai-review-context/result.json') == ''
+        continue-on-error: true
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: ai-review-context/prompt.md
+          output-schema-file: ai-review-context/output-schema.json
+          output-file: ai-review-context/codex-result.json
+          sandbox: read-only
+
+      - name: Keep the Codex result
+        if: steps.mode.outputs.mode == 'review' && steps.codex.outcome == 'success'
+        run: |
+          set -euo pipefail
+          if [ ! -f ai-review-context/result.json ] && jq -e '.verdict == "PASS" or .verdict == "FAIL"' ai-review-context/codex-result.json > /dev/null 2>&1; then
+            cp ai-review-context/codex-result.json ai-review-context/result.json; echo codex > ai-review-context/provider.txt
+          else
+            echo "::warning::Codex returned no usable verdict; trying the next provider."
+          fi
+
+      - name: Fall back to Copilot code review
+        if: steps.mode.outputs.mode == 'review' && steps.provider.outputs.copilot == 'yes' && hashFiles('ai-review-context/result.json') == ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          bot='copilot-pull-request-reviewer[bot]'
+          q=".[] | select(.user.login == \"$bot\" and .commit_id == \"$HEAD_SHA\") | {html_url}"
+          found=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews?per_page=100" --jq "$q" | jq -sc last)
+          if [ -z "$found" ] || [ "$found" = null ]; then
+            # Best effort: a repository Copilot-review ruleset may already have requested it.
+            gh api -X POST "repos/$REPO/pulls/$PR/requested_reviewers" -f "reviewers[]=$bot" > /dev/null 2>&1 \
+              || echo "::warning::Could not request Copilot review with the workflow token; waiting in case a ruleset requested it."
+            deadline=$(( $(date +%s) + COPILOT_WAIT_SECONDS ))
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              sleep 30
+              found=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews?per_page=100" --jq "$q" | jq -sc last)
+              [ -n "$found" ] && [ "$found" != null ] && break
+            done
+          fi
+          if [ -z "$found" ] || [ "$found" = null ]; then
+            echo "::warning::No Copilot review arrived for $HEAD_SHA."; exit 0
+          fi
+          url=$(printf '%s' "$found" | jq -r .html_url)
+          jq -n --arg url "$url" '{verdict:"PASS", needs_bradley:false, read_entire_diff:false,
+            summary:("Claude and Codex were unavailable, so this run relied on Copilot code review ([review](" + $url + ")). Copilot leaves comments only and does not check spec fit; every Copilot thread must be resolved before this PR can merge."),
+            findings:[]}' > ai-review-context/result.json
+          echo copilot > ai-review-context/provider.txt
+
+      - name: Publish the review and decide
+        if: steps.mode.outputs.mode == 'review' || steps.mode.outputs.mode == 'gate'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MODE: ${{ steps.mode.outputs.mode }}
+          DEPENDABOT: ${{ steps.mode.outputs.dependabot }}
+          FLAGGED: ${{ steps.ctx.outputs.flagged }}
+          SECTION_OK: ${{ steps.ctx.outputs.section_ok }}
+          APPROVED: ${{ steps.ctx.outputs.approved }}
+        run: |
+          set -euo pipefail
+          ctx=ai-review-context
+          marker_re="<!-- ai-review:result sha=$HEAD_SHA verdict=([A-Z]+) provider=([a-z]+) -->"
+
+          if [ "$MODE" = gate ]; then
+            # Reuse the last AI verdict for this exact head instead of paying for a new review.
+            last=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews?per_page=100" \
+              --jq '.[] | select(.user.login == "github-actions[bot]") | .body' | grep -oE "$marker_re" | tail -n1 || true)
+            if [ -z "$last" ]; then
+              echo "::error::No ai-review verdict exists for head $HEAD_SHA yet. Re-run the latest ai-review run for the push."; exit 1
+            fi
+            verdict=$(printf '%s' "$last" | sed -E "s/.*verdict=([A-Z]+).*/\1/")
+            provider=$(printf '%s' "$last" | sed -E "s/.*provider=([a-z]+).*/\1/")
+          else
+            if [ ! -f "$ctx/result.json" ]; then
+              if [ "$DEPENDABOT" = true ]; then
+                echo "::error::Dependabot PRs get no Actions secrets, so no AI provider could run. Add the review credential as a Dependabot secret, or review this PR another way."
+              else
+                echo "::error::No AI reviewer was available (Claude: no credential, quota or auth failure; Codex: no OPENAI_API_KEY; Copilot: no review arrived). The PR cannot pass ai-review until one works."
+              fi
+              exit 1
+            fi
+            provider=$(cat "$ctx/provider.txt")
+            verdict=$(jq -r .verdict "$ctx/result.json")
+            if [ "$(jq -r .read_entire_diff "$ctx/result.json")" = false ] && [ "$provider" != copilot ]; then
+              verdict=FAIL; echo "::error::The reviewer did not read the whole diff."
+            fi
+            if [ "$(jq -r .needs_bradley "$ctx/result.json")" = true ] && [ "$FLAGGED" != true ]; then
+              gh api -X POST "repos/$REPO/issues/$PR/labels" -f 'labels[]=needs-bradley' > /dev/null
+              FLAGGED=true
+              echo "::notice::The reviewer judged this change consequential; added needs-bradley."
+            fi
+
+            body=$(jq -r --arg p "$provider" --arg v "$verdict" --arg sha "$HEAD_SHA" '
+              "## ai-review: " + $v + " (" + $p + ")\n\n" + .summary + "\n\n" +
+              (if (.findings | length) == 0 then "No findings.\n"
+               else "| Severity | Where | Finding |\n|---|---|---|\n" +
+                 ([.findings[] | "| " + .severity + " | `" + .file + (if .line > 0 then ":" + (.line|tostring) else "" end) + "` | **" + (.title|gsub("\\|";"/")) + "** " + (.detail|gsub("\n";" ")|gsub("\\|";"/")) + " |"] | join("\n")) + "\n" end) +
+              "\nEvery finding must be addressed and every thread resolved before this PR leaves draft.\n\n" +
+              "<!-- ai-review:result sha=" + $sha + " verdict=" + $v + " provider=" + $p + " -->"' "$ctx/result.json")
+            comments=$(jq -c '[.findings[] | select(.line > 0) | {path: .file, line: .line, side: "RIGHT",
+              body: ("**ai-review " + .severity + ":** " + .title + "\n\n" + .detail)}]' "$ctx/result.json")
+            if ! jq -n --arg body "$body" --arg sha "$HEAD_SHA" --argjson c "$comments" \
+                 '{commit_id:$sha, event:"COMMENT", body:$body, comments:$c}' \
+               | gh api -X POST "repos/$REPO/pulls/$PR/reviews" --input - > /dev/null 2>&1; then
+              echo "::warning::Inline comments were rejected (a line is outside the diff); posting the review without them."
+              jq -n --arg body "$body" --arg sha "$HEAD_SHA" '{commit_id:$sha, event:"COMMENT", body:$body}' \
+                | gh api -X POST "repos/$REPO/pulls/$PR/reviews" --input - > /dev/null
+            fi
+          fi
+
+          status=0
+          if [ "$verdict" != PASS ]; then echo "::error::ai-review ($provider) found blocking problems. See the review on the PR."; status=1; fi
+          if [ "$FLAGGED" = true ] && [ "$SECTION_OK" != true ]; then
+            echo "::error::This PR is consequential (needs-bradley). Fill in the 'What Bradley needs to know' section at the top of the description."; status=1
+          fi
+          if [ "$FLAGGED" = true ] && [ "$APPROVED" != true ]; then
+            echo "::error::This PR is consequential (needs-bradley) and needs $OWNER_LOGIN's approval of head $HEAD_SHA."; status=1
+          fi
+          [ "$status" = 0 ] && echo "::notice::ai-review passed ($provider)."
+          exit "$status"

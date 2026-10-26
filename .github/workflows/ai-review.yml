@@ -104,13 +104,18 @@ jobs:
           set -euo pipefail
           ctx=ai-review-context
           rm -rf "$ctx"; mkdir -p "$ctx"
-          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$BASE_SHA"
+          # Checkout ran with persist-credentials: false, so git has no token. Reads of the base
+          # go through the API, and the one git fetch below passes the token for that call only.
+          authgit() {
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" "$@"
+          }
 
           # Policy files come from the BASE branch so a PR cannot weaken its own review.
           # The first rollout PR has no base copy yet, so it falls back to the PR's copy.
           for f in prompt.md output-schema.json consequential-paths.txt; do
-            if git cat-file -e "$BASE_SHA:.github/ai-review/$f" 2>/dev/null; then
-              git show "$BASE_SHA:.github/ai-review/$f" > "$ctx/$f"
+            if gh api -H 'Accept: application/vnd.github.raw' \
+                "repos/$REPO/contents/.github/ai-review/$f?ref=$BASE_SHA" > "$ctx/$f" 2>/dev/null; then
+              :
             elif [ -f ".github/ai-review/$f" ]; then
               echo "::warning::.github/ai-review/$f is not on the base branch yet; using the PR's copy."
               cp ".github/ai-review/$f" "$ctx/$f"
@@ -130,7 +135,7 @@ jobs:
           # Full diff: the API refuses very large diffs, so fall back to git.
           if ! gh api -H 'Accept: application/vnd.github.diff' "repos/$REPO/pulls/$PR" > "$ctx/pr.diff" 2>/dev/null; then
             mb=$(gh api "repos/$REPO/compare/$BASE_SHA...$HEAD_SHA" --jq .merge_base_commit.sha)
-            git fetch --no-tags --depth=1 origin "$mb"
+            authgit fetch --no-tags --depth=1 origin "$mb"
             git diff "$mb" "$HEAD_SHA" > "$ctx/pr.diff"
           fi
           printf 'PR #%s in %s\nbase %s\nhead %s\nchanged files: %s\ndiff lines: %s\n' \

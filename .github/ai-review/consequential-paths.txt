@@ -1,0 +1,38 @@
+# Paths that make a pull request consequential under the xekoms PR policy (rule 6).
+# One extended regular expression per line, matched against each changed file path.
+# A match adds the `needs-bradley` label, requires a filled-in "What Bradley needs to know"
+# section, and requires Bradley's approval on the exact head before `ai-review` passes.
+# The copy on the BASE branch is the one that is enforced, so a PR cannot loosen its own gate.
+# Lines starting with # are comments.
+
+# Database migrations, schema and data
+(^|/)migrations?/
+(^|/)supabase/
+(^|/)schema(s)?(/|\.)
+(^|/)prisma/
+\.sql$
+
+# Security, auth, RLS, permissions, ownership
+(^|/)(auth|security|rls|policies|permissions|grants)(/|\.|_)
+(^|/)SECURITY\.md$
+(^|/)CODEOWNERS$
+
+# Secrets and credentials
+(^|/)\.env(\.|$)
+(^|/)secrets?(/|\.)
+(^|/)bws(/|\.)
+
+# Deploys, DNS, infrastructure
+(^|/)(deploy|deployment|infra|infrastructure|terraform|k8s|helm|ops)/
+(^|/)wrangler\.(toml|json|jsonc)$
+(^|/)vercel\.json$
+(^|/)netlify\.toml$
+(^|/)fly\.toml$
+(^|/)Dockerfile[^/]*$
+(^|/)docker-compose[^/]*\.ya?ml$
+
+# CI, review rules and repository policy (changes to "these rules")
+^\.github/workflows/
+^\.github/ai-review/
+^\.github/(pull_request_template|PULL_REQUEST_TEMPLATE)\.md$
+^\.github/dependabot\.ya?ml$

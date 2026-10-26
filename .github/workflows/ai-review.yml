@@ -155,7 +155,7 @@ jobs:
             s/\r//g; s/<!--.*?-->//gs;
             if (/^#+[ \t]*What Bradley needs to know[^\n]*\n(.*?)(?=^#+[ \t]|\z)/msi) { $x = $1; $x =~ s/^\s+|\s+$//g; print $x }')
           section_ok=false
-          if [ -n "$section" ] && ! printf '%s' "$section" | grep -qiE '^[[:space:]]*(nothing|n/?a|none)\b'; then
+          if [ -n "$section" ] && ! grep -qiE '^[[:space:]]*(nothing|n/?a|none)\b' <<< "$section"; then
             section_ok=true
           fi
 

@@ -31,3 +31,5 @@ These are GitHub Actions routes in GitHub discussions and the Actions manual for
 Offline routing checks: `node --test .github/claude-routing.test.mjs`. These checks do not invoke Claude or read credentials.
 
 Runner selected for this new interactive workflow: `blacksmith-2vcpu-ubuntu-2404`. Existing workflows are unchanged. Credential/App availability and runner readiness are activation prerequisites, not established by branch preparation.
+
+Exact routing finishes before the action job enters shared concurrency. Unrelated events do not replace pending requests. GitHub still retains at most one pending accepted invocation per group; a later accepted request may replace it.

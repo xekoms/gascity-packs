@@ -23,12 +23,8 @@ on:
   issues:
     types: [opened, assigned]
 
-concurrency:
-  group: claude-interactive-${{ github.event.issue.number || github.event.pull_request.number || github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  claude:
+  route:
     if: |
       (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner && inputs.prompt != '' && (inputs.billing == 'subscription' || inputs.billing == 'api')) ||
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') && github.event.comment.author_association == 'OWNER') ||
@@ -37,20 +33,11 @@ jobs:
       (github.event_name == 'issues' && github.event.action == 'opened' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) && github.event.issue.author_association == 'OWNER') ||
       (github.event_name == 'issues' && github.event.action == 'assigned' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) && github.actor == github.repository_owner)
     runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 60
-    env:
-      # Do not inherit an alternate provider credential from the runner.
-      ANTHROPIC_API_KEY: ""
-      CLAUDE_CODE_OAUTH_TOKEN: ""
-      CLAUDE_CODE_USE_BEDROCK: ""
-      CLAUDE_CODE_USE_VERTEX: ""
-      CLAUDE_CODE_USE_FOUNDRY: ""
-    permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-      id-token: write
-      actions: read
+    permissions: {}
+    outputs:
+      should_run: ${{ steps.route.outputs.should_run }}
+      billing: ${{ steps.route.outputs.billing }}
+      trigger: ${{ steps.route.outputs.trigger }}
     steps:
       - name: Classify invocation and billing
         id: route
@@ -91,19 +78,41 @@ jobs:
             core.setOutput("trigger", shouldRun ? billing === "api" ? "@claude-api" : "@claude" : "");
             // END CLAUDE ROUTING
 
+  claude:
+    concurrency:
+      group: claude-interactive-${{ github.event.issue.number || github.event.pull_request.number || github.ref }}
+      cancel-in-progress: false
+    needs: route
+    if: needs.route.outputs.should_run == 'true'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 60
+    env:
+      # Do not inherit an alternate provider credential from the runner.
+      ANTHROPIC_API_KEY: ""
+      CLAUDE_CODE_OAUTH_TOKEN: ""
+      CLAUDE_CODE_USE_BEDROCK: ""
+      CLAUDE_CODE_USE_VERTEX: ""
+      CLAUDE_CODE_USE_FOUNDRY: ""
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
       - name: Checkout repository
-        if: steps.route.outputs.should_run == 'true'
+        if: needs.route.outputs.should_run == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
       - name: Run Claude Code
-        if: steps.route.outputs.should_run == 'true'
+        if: needs.route.outputs.should_run == 'true'
         uses: anthropics/claude-code-action@8041f1d17e0e7d2f2cfe35002962e9f26237c0bb # v1.0.263
         with:
-          trigger_phrase: ${{ steps.route.outputs.trigger }}
-          anthropic_api_key: ${{ steps.route.outputs.billing == 'api' && secrets.ANTHROPIC_API_KEY || '' }}
-          claude_code_oauth_token: ${{ steps.route.outputs.billing == 'subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          trigger_phrase: ${{ needs.route.outputs.trigger }}
+          anthropic_api_key: ${{ needs.route.outputs.billing == 'api' && secrets.ANTHROPIC_API_KEY || '' }}
+          claude_code_oauth_token: ${{ needs.route.outputs.billing == 'subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
           prompt: ${{ github.event_name == 'workflow_dispatch' && inputs.prompt || (github.event_name == 'issues' && github.event.action == 'assigned' && format('{0} {1}', github.event.issue.title, github.event.issue.body)) || '' }}
           additional_permissions: |
             actions: read

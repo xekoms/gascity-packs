@@ -89,7 +89,7 @@ test("unsupported actions and events do not invoke Claude", () => {
 test("only the selected credential reaches the action, with no cross-route fallback", () => {
   function credential(name, billing, secrets) {
     const expression = workflow.match(new RegExp("          " + name + ": \\$\\{\\{ (.+) \\}\\}"))[1];
-    return new Function("steps", "secrets", "return (" + expression + ")")({ route: { outputs: { billing } } }, secrets);
+    return new Function("needs", "secrets", "return (" + expression + ")")({ route: { outputs: { billing } } }, secrets);
   }
   for (const billing of ["subscription", "api", ""]) {
     for (const present of [true, false]) {
@@ -111,7 +111,15 @@ test("classification is before every gated original step and treats payloads as 
   const scripts = workflow.match(/\/\/ BEGIN CLAUDE ROUTING[\s\S]*?\/\/ END CLAUDE ROUTING/)[0];
   assert.ok(!scripts.includes("${{"));
   const steps = workflow.split("      - name:").slice(2);
-  for (const step of steps) assert.ok(step.includes("if: steps.route.outputs.should_run == 'true'"));
+  for (const step of steps) assert.ok(step.includes("if: needs.route.outputs.should_run == 'true'"));
   assert.ok(workflow.includes('ANTHROPIC_API_KEY: ""'));
   assert.ok(workflow.includes('CLAUDE_CODE_OAUTH_TOKEN: ""'));
+});
+
+test("exact admission precedes shared action-job concurrency", () => {
+  assert.ok(!/^concurrency:/m.test(workflow));
+  assert.ok(workflow.includes("    needs: route\n    if: needs.route.outputs.should_run == 'true'"));
+  const routeJob = workflow.slice(workflow.indexOf("  route:\n"), workflow.indexOf("  claude:\n"));
+  assert.ok(!routeJob.includes("concurrency:"));
+  assert.ok(!routeJob.includes("secrets."));
 });

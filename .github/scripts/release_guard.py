@@ -23,6 +23,7 @@ ruleset (integration 15368). Standard library only; stdlib urllib, no third-part
 # One file shared verbatim by every xekoms repo, whose formatters use different line
 # lengths, so it is hand-formatted to 88 columns and the formatter leaves it alone.
 import datetime as dt
+import hashlib
 import itertools
 import json
 import os
@@ -36,7 +37,8 @@ UTC = dt.timezone(dt.timedelta(0))
 CONTEXT = "release-guard"
 ACTIONS_BOT = "github-actions[bot]"
 BLOCK_LABEL = "release-guard-block"
-SENSITIVE_LABEL = "needs-bradley"
+# The owner-review label, kept as a SHA-256 so his name stays out of every repo.
+OWNER_LABEL_SHA256 = "aada8fcebdfb3db54e50ec34877f9fca45522d8527d7b7a5ccfe20eb56527a55"
 MARKER = "<!-- release-guard:inspection-queued -->"
 
 OK = "No sensitive paths"
@@ -305,8 +307,11 @@ def event():
                 sample.append(path)
     if count >= 3000:
         reasons.add("over 3000 files")
-    if SENSITIVE_LABEL in labels:
-        reasons.add(f"{SENSITIVE_LABEL} label")
+    if any(
+        hashlib.sha256(name.encode()).hexdigest() == OWNER_LABEL_SHA256
+        for name in labels
+    ):
+        reasons.add("owner-review label")
     if not reasons:
         api.post_status(sha, "success", OK, run_url)
         return

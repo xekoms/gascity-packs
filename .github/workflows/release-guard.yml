@@ -5,7 +5,7 @@ name: release-guard
 #   - Ordinary PR: `success` "No sensitive paths" within seconds.
 #   - Sensitive PR (sign-in/auth, roles/permissions/policies/RLS, secrets/.env, schema and
 #     migrations, supabase/, deploy config such as .github/workflows, vercel.json,
-#     wrangler.toml, Dockerfile, infra; or the `needs-bradley` label): `pending`
+#     wrangler.toml, Dockerfile, infra; or the owner-review label): `pending`
 #     "Release Guard inspection queued", plus one PR comment carrying the stable marker
 #     `release-guard:inspection-queued`. Release Guard (korg-xekoms) finds that marker on its
 #     check-in routine and opens a Linear inspection issue. There is no Linear secret in

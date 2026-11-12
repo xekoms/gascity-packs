@@ -58,7 +58,7 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      DEFER_MINUTES: "20"
+      DEFER_MINUTES: 20
     steps:
       - name: Check out the base branch (trusted script only)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

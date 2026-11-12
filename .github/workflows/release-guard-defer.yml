@@ -28,9 +28,9 @@ jobs:
     runs-on: ${{ fromJSON(vars.RELEASE_GUARD_RUNS_ON || '["self-hosted", "Linux", "X64", "container"]') }}
     timeout-minutes: 5
     permissions:
-      contents: read        # the default-branch script
-      pull-requests: read   # open PRs and their labels
-      statuses: write       # the deferred `release-guard` status
+      contents: read # the default-branch script
+      pull-requests: read # open PRs and their labels
+      statuses: write # the deferred `release-guard` status
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}

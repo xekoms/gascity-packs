@@ -48,10 +48,10 @@ jobs:
     runs-on: ${{ fromJSON(vars.RELEASE_GUARD_RUNS_ON || '["self-hosted", "Linux", "X64", "container"]') }}
     timeout-minutes: 5
     permissions:
-      contents: read        # the base-branch script
-      pull-requests: read   # changed-file names and labels
-      statuses: write       # the `release-guard` commit status
-      issues: write         # the one "inspection queued" PR comment
+      contents: read # the base-branch script
+      pull-requests: read # changed-file names and labels
+      statuses: write # the `release-guard` commit status
+      issues: write # the one "inspection queued" PR comment
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}

@@ -1,0 +1,47 @@
+name: release-guard-defer
+
+# Turns a `release-guard` status that has sat at "Release Guard inspection queued" for
+# DEFER_MINUTES or more into `success` "Deferred – follow-up required (Release Guard)", on
+# every open PR without the `release-guard-block` label. See release-guard.yml.
+#
+# Runs from the default branch (schedule and workflow_dispatch always do), reads only PR
+# metadata and commit statuses through the API, checks out nothing from any PR, and uses no
+# secrets. Its statuses come from the same GitHub Actions integration (15368) as the event
+# run's. GitHub can start a scheduled run late (often 5-15 minutes at busy times), so the
+# real wait is DEFER_MINUTES plus up to 15 minutes plus that delay. workflow_dispatch runs it
+# at once.
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-guard-defer
+  cancel-in-progress: false
+
+jobs:
+  defer:
+    # The fleet's self-hosted pool by default; a repo whose runners differ sets the Actions
+    # variable RELEASE_GUARD_RUNS_ON to a JSON list, e.g. '["ubuntu-latest"]' (same file everywhere).
+    runs-on: ${{ fromJSON(vars.RELEASE_GUARD_RUNS_ON || '["self-hosted", "Linux", "X64", "container"]') }}
+    timeout-minutes: 5
+    permissions:
+      contents: read        # the default-branch script
+      pull-requests: read   # open PRs and their labels
+      statuses: write       # the deferred `release-guard` status
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      DEFER_MINUTES: "20"
+    steps:
+      - name: Check out the default branch (trusted script only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts/release_guard.py
+          sparse-checkout-cone-mode: false
+      - name: Defer long-queued inspections
+        run: python3 -I .github/scripts/release_guard.py defer

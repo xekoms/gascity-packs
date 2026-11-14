@@ -15,6 +15,16 @@ name: release-guard
 #   - Label `release-guard-block`: `failure` "Release Guard P0/P1 finding – see PR comments".
 #     Release Guard adds it ONLY for a P0/P1 finding; P2 and lower are PR comments plus
 #     Linear issues. Removing the label re-runs this and goes back to the rules above.
+#   - One commit status is shared by every PR whose head is that commit, so each run weighs
+#     all open PRs on the head and posts the most restrictive: failure > pending > success.
+#   - The PR never passes as Deferred until the inspection comment is really posted; a
+#     failed comment is retried, then left pending for the scheduled run to retry.
+#
+# LABELS. `labeled`/`unlabeled` re-run this on any label change: a label filter cannot be
+# written here (the owner-review label is matched by hash, so its name stays out of this
+# file), and a re-run is idempotent. A label added with a job token (ai-review adds the
+# owner-review label that way) starts NO run, so release-guard-defer.yml also runs when
+# ai-review completes and on its schedule, re-checking every open PR's current labels.
 #
 # WHY pull_request_target, AND THE RULE THAT MAKES IT SAFE (the same rule as privacy-scan.yml).
 # On `pull_request`, GitHub runs the PR's own copy, so a PR could rewrite the gate to pass
@@ -38,7 +48,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: release-guard-${{ github.event.pull_request.number }}
+  group: release-guard-${{ github.event.pull_request.head.sha }} # one status per commit
   cancel-in-progress: true
 
 jobs:

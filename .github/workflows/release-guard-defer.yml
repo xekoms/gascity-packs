@@ -1,0 +1,56 @@
+name: release-guard-defer
+
+# Re-checks every open PR's current labels and changed-file names and settles the
+# `release-guard` status on each head commit (most restrictive across PRs sharing it):
+# it queues a PR that gained the owner-review label from a job token (which starts no
+# release-guard run), re-posts a missing inspection comment, and turns a status that has
+# sat queued for DEFER_MINUTES or more into `success` "Deferred – follow-up required
+# (Release Guard)" once that comment exists. A head it cannot settle stays pending and
+# this run exits with an error, so the next run retries it. See release-guard.yml.
+#
+# Runs from the default branch (schedule and workflow_dispatch always do), reads only PR
+# metadata and commit statuses through the API, checks out nothing from any PR, and uses no
+# secrets. Its statuses come from the same GitHub Actions integration (15368) as the event
+# run's. GitHub can start a scheduled run late (often 5-15 minutes at busy times), so the
+# real wait is DEFER_MINUTES plus up to 15 minutes plus that delay. workflow_dispatch runs it
+# at once. workflow_run also starts it when ai-review completes, so a label ai-review adds
+# is acted on at once; workflow_run, like schedule, runs this default-branch copy only.
+on:
+  schedule:
+    - cron: 7,22,37,52 * * * *
+  workflow_dispatch:
+  workflow_run:
+    workflows: [ai-review]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: release-guard-defer
+  cancel-in-progress: false
+
+jobs:
+  defer:
+    # The fleet's self-hosted pool by default; a repo whose runners differ sets the Actions
+    # variable RELEASE_GUARD_RUNS_ON to a JSON list, e.g. '["ubuntu-latest"]' (same file everywhere).
+    runs-on: ${{ fromJSON(vars.RELEASE_GUARD_RUNS_ON || '["self-hosted", "Linux", "X64", "container"]') }}
+    timeout-minutes: 10
+    permissions:
+      contents: read # the default-branch script
+      pull-requests: read # open PRs, their labels and changed-file names
+      statuses: write # the settled `release-guard` status
+      issues: write # re-post a missing "inspection queued" PR comment
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      DEFER_MINUTES: 20
+    steps:
+      - name: Check out the default branch (trusted script only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts/release_guard.py
+          sparse-checkout-cone-mode: false
+      - name: Settle every open PR's release-guard status
+        run: python3 -I .github/scripts/release_guard.py defer

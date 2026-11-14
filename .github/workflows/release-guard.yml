@@ -1,0 +1,83 @@
+name: release-guard
+
+# WHAT THIS IS. `release-guard` is a required check that never holds a merge for long.
+# Xekoms's rule D9: a gate is there for quality, not to slow work down.
+#   - Ordinary PR: `success` "No sensitive paths" within seconds.
+#   - Sensitive PR (sign-in/auth, roles/permissions/policies/RLS, secrets/.env, schema and
+#     migrations, supabase/, deploy config such as .github/workflows, vercel.json,
+#     wrangler.toml, Dockerfile, infra; or the owner-review label): `pending`
+#     "Release Guard inspection queued", plus one PR comment carrying the stable marker
+#     `release-guard:inspection-queued`. Release Guard (korg-xekoms) finds that marker on its
+#     check-in routine and opens a Linear inspection issue. There is no Linear secret in
+#     this repo on purpose; none is added. After DEFER_MINUTES the scheduled
+#     release-guard-defer.yml turns it into `success` "Deferred – follow-up required
+#     (Release Guard)", so the wait is at most about 20-35 minutes.
+#   - Label `release-guard-block`: `failure` "Release Guard P0/P1 finding – see PR comments".
+#     Release Guard adds it ONLY for a P0/P1 finding; P2 and lower are PR comments plus
+#     Linear issues. Removing the label re-runs this and goes back to the rules above.
+#   - One commit status is shared by every PR whose head is that commit, so each run weighs
+#     all open PRs on the head and posts the most restrictive: failure > pending > success.
+#   - The PR never passes as Deferred until the inspection comment is really posted; a
+#     failed comment is retried, then left pending for the scheduled run to retry.
+#
+# LABELS. `labeled`/`unlabeled` re-run this on any label change: a label filter cannot be
+# written here (the owner-review label is matched by hash, so its name stays out of this
+# file), and a re-run is idempotent. A label added with a job token (ai-review adds the
+# owner-review label that way) starts NO run, so release-guard-defer.yml also runs when
+# ai-review completes and on its schedule, re-checking every open PR's current labels.
+#
+# WHY pull_request_target, AND THE RULE THAT MAKES IT SAFE (the same rule as privacy-scan.yml).
+# On `pull_request`, GitHub runs the PR's own copy, so a PR could rewrite the gate to pass
+# itself. `pull_request_target` always runs the base branch's copy. The rule: the PR is DATA
+# only. The one checkout is the base branch (the default ref), sparse, for
+# .github/scripts/release_guard.py. Nothing from the PR is checked out, fetched, built or
+# run: the script reads the changed-file NAMES and the labels from the API, nothing else.
+# Never pass the PR's ref to actions/checkout.
+#
+# FORKS: this job uses no secrets, only the job token, and runs no PR code, so a fork PR gets
+# the same treatment as any other and cannot reach anything. Path names are printed in the
+# comment only after every character outside [A-Za-z0-9._/+-] is replaced.
+#
+# COMMIT STATUS: posted with the job token, so it comes from the GitHub Actions integration
+# (15368), the only source the ruleset accepts. If the script errors, the last step queues
+# the PR instead (pending, deferred later), so a broken guard never blocks a merge.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+permissions: {}
+
+concurrency:
+  group: release-guard-${{ github.event.pull_request.head.sha }} # one status per commit
+  cancel-in-progress: true
+
+jobs:
+  release-guard:
+    # The fleet's self-hosted pool by default; a repo whose runners differ sets the Actions
+    # variable RELEASE_GUARD_RUNS_ON to a JSON list, e.g. '["ubuntu-latest"]' (same file everywhere).
+    runs-on: ${{ fromJSON(vars.RELEASE_GUARD_RUNS_ON || '["self-hosted", "Linux", "X64", "container"]') }}
+    timeout-minutes: 5
+    permissions:
+      contents: read # the base-branch script
+      pull-requests: read # changed-file names and labels
+      statuses: write # the `release-guard` commit status
+      issues: write # the one "inspection queued" PR comment
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      DEFER_MINUTES: 20
+    steps:
+      - name: Check out the base branch (trusted script only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts/release_guard.py
+          sparse-checkout-cone-mode: false
+      - name: Post release-guard on the PR head
+        run: python3 -I .github/scripts/release_guard.py event
+      - name: On error, queue instead of blocking
+        if: failure()
+        run: python3 -I .github/scripts/release_guard.py queue
